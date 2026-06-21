@@ -16,17 +16,46 @@ class FarfetchClient:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "it-IT,it;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
     }
 
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self._warmed_up = False
 
     async def init(self):
-        timeout = aiohttp.ClientTimeout(total=20)
-        self.session = aiohttp.ClientSession(headers=self.HEADERS, timeout=timeout)
+        timeout = aiohttp.ClientTimeout(total=25)
+        # CookieJar di default mantiene i cookie tra le richieste,
+        # fondamentale per superare i controlli anti-bot
+        self.session = aiohttp.ClientSession(
+            headers=self.HEADERS,
+            timeout=timeout,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+        )
+
+    async def _warmup(self):
+        """Visita la homepage prima della prima richiesta reale per
+        ottenere i cookie di sessione necessari a superare le protezioni anti-bot."""
+        if self._warmed_up:
+            return
+        try:
+            async with self.session.get(f"{self.BASE_URL}/it/") as resp:
+                await resp.read()
+            self._warmed_up = True
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass  # se la warmup fallisce, proviamo comunque la richiesta reale
 
     async def close(self):
         if self.session and not self.session.closed:
@@ -66,10 +95,18 @@ class FarfetchClient:
           name, brand, price, image, url, sizes
           sizes = [{"size": "M", "boutiques": ["Boutique A", "Boutique B"], "available": True}, ...]
         """
+        await self._warmup()
+
         url = f"{self.BASE_URL}/it/shopping/item-{product_id}.aspx"
-        async with self.session.get(url) as resp:
+        headers = {"Referer": f"{self.BASE_URL}/it/"}
+        async with self.session.get(url, headers=headers) as resp:
             if resp.status == 404:
                 return None
+            if resp.status == 403:
+                raise ConnectionError(
+                    "Farfetch ha bloccato la richiesta (protezione anti-bot). "
+                    "Riprova tra qualche secondo."
+                )
             if resp.status != 200:
                 raise ConnectionError(f"HTTP {resp.status} per ID {product_id}")
             html = await resp.text()
@@ -211,14 +248,17 @@ class FarfetchClient:
         Cerca i prodotti di una boutique per nome.
         Prima tenta la ricerca per sellers ID, poi via URL slug.
         """
+        await self._warmup()
+
         slug = boutique_name.lower().strip().replace(" ", "-").replace("'", "")
         products = []
         seen_ids = set()
+        headers = {"Referer": f"{self.BASE_URL}/it/"}
 
         for gender in ("women", "men"):
             url = f"{self.BASE_URL}/it/shopping/{gender}/{slug}/items.aspx"
             try:
-                async with self.session.get(url) as resp:
+                async with self.session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         html = await resp.text()
                         items = self._parse_listing(html)
