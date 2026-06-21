@@ -1,48 +1,42 @@
 """
-Farfetch API client - estrae dati da Farfetch tramite le loro API interne
+Farfetch API client - estrae dati da Farfetch tramite le loro API interne.
+
+Usa curl_cffi al posto di aiohttp/requests perché imita anche l'impronta TLS
+(JA3) di un vero browser Chrome, non solo gli header HTTP. Questo è necessario
+perché le protezioni anti-bot di Farfetch (Akamai/PerimeterX) bloccano le
+richieste basandosi sulla firma TLS della connessione, che librerie come
+aiohttp non possono replicare indipendentemente dagli header inviati.
 """
-import aiohttp
 import asyncio
 import json
 import re
 from typing import Optional, List, Dict
 
+from curl_cffi.requests import AsyncSession
+
+
 class FarfetchClient:
     BASE_URL = "https://www.farfetch.com"
 
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    # Profilo Chrome da imitare anche a livello di impronta TLS/HTTP2
+    IMPERSONATE = "chrome124"
+
+    EXTRA_HEADERS = {
         "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
     }
 
     def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: Optional[AsyncSession] = None
         self._warmed_up = False
+        # Ultima richiesta: utile per diagnosticare un eventuale nuovo blocco
+        self.last_debug: Dict = {}
 
     async def init(self):
-        timeout = aiohttp.ClientTimeout(total=25)
-        # CookieJar di default mantiene i cookie tra le richieste,
-        # fondamentale per superare i controlli anti-bot
-        self.session = aiohttp.ClientSession(
-            headers=self.HEADERS,
-            timeout=timeout,
-            cookie_jar=aiohttp.CookieJar(unsafe=True),
-        )
+        self.session = AsyncSession(impersonate=self.IMPERSONATE, timeout=25)
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
 
     async def _warmup(self):
         """Visita la homepage prima della prima richiesta reale per
@@ -50,16 +44,31 @@ class FarfetchClient:
         if self._warmed_up:
             return
         try:
-            async with self.session.get(f"{self.BASE_URL}/it/") as resp:
-                await resp.read()
+            await self.session.get(f"{self.BASE_URL}/it/", headers=self.EXTRA_HEADERS)
             self._warmed_up = True
             await asyncio.sleep(0.8)
         except Exception:
             pass  # se la warmup fallisce, proviamo comunque la richiesta reale
 
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+    def debug_report(self) -> Optional[str]:
+        """Genera un report testuale completo dell'ultima richiesta HTTP fatta,
+        usato dal comando /debug per la diagnostica."""
+        d = self.last_debug
+        if not d:
+            return None
+
+        lines = []
+        lines.append(f"URL richiesto: {d.get('url', '?')}")
+        lines.append(f"Status HTTP:   {d.get('status', d.get('error', '?'))}")
+        lines.append("")
+        lines.append("─── HEADERS DI RISPOSTA ───")
+        for k, v in (d.get("headers") or {}).items():
+            lines.append(f"{k}: {v}")
+        lines.append("")
+        lines.append("─── BODY (HTML/JSON ricevuto) ───")
+        lines.append(d.get("body") or d.get("snippet") or "(vuoto)")
+
+        return "\n".join(lines)
 
     # ─── Utility: estrai JSON embedded nella pagina ────────────────────────────
 
@@ -87,36 +96,70 @@ class FarfetchClient:
                 pass
         return None
 
+    # ─── Richiesta HTTP centralizzata con diagnostica ──────────────────────────
+
+    async def _fetch_page(self, url: str, params: Optional[Dict] = None) -> Optional[str]:
+        """Esegue una GET e ritorna l'HTML. None se 404. Solleva ConnectionError
+        per altri errori, salvando sempre i dettagli completi in self.last_debug."""
+        headers = {**self.EXTRA_HEADERS, "Referer": f"{self.BASE_URL}/it/"}
+        try:
+            resp = await self.session.get(url, headers=headers, params=params)
+        except Exception as e:
+            self.last_debug = {"url": url, "error": str(e)}
+            raise ConnectionError(f"Errore di connessione: {e}")
+
+        body = resp.text or ""
+        try:
+            resp_headers = dict(resp.headers)
+        except Exception:
+            resp_headers = {}
+
+        self.last_debug = {
+            "url": url,
+            "status": resp.status_code,
+            "snippet": body[:180].replace("\n", " ").strip(),
+            "headers": resp_headers,
+            "body": body,  # contenuto completo, usato dal comando /debug
+        }
+
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 403:
+            raise ConnectionError(
+                "Farfetch ha bloccato la richiesta (403 – protezione anti-bot)."
+            )
+        if resp.status_code != 200:
+            raise ConnectionError(f"HTTP {resp.status_code} su {url}")
+        return body
+
     # ─── 1. PRODOTTO: stock per taglia/boutique ────────────────────────────────
 
     async def get_product(self, identifier: str) -> Optional[Dict]:
         """
         Accetta sia un ID numerico (es. "34618362") sia un link Farfetch completo.
-        Restituisce un dict con:
-          name, brand, price, image, url, sizes
-          sizes = [{"size": "M", "boutiques": ["Boutique A", "Boutique B"], "available": True}, ...]
+        Restituisce un dict con: name, brand, price, image, url, sizes
         """
         await self._warmup()
 
         identifier = identifier.strip()
         product_id = self._extract_id(identifier)
 
-        # Caso 1: l'utente ha incollato un link Farfetch completo → usalo direttamente
+        # Caso 1: link Farfetch completo → usalo direttamente
         if "farfetch.com" in identifier:
-            page_url = identifier.split("?")[0]  # rimuove parametri di tracking
+            page_url = identifier.split("?")[0]
             html = await self._fetch_page(page_url)
             if html is None:
                 return None
             return self._parse_html(html, product_id or "N/A", page_url)
 
-        # Caso 2: solo l'ID → prova lo shortcut diretto
+        # Caso 2: solo ID → prova lo shortcut diretto
         if product_id:
             shortcut_url = f"{self.BASE_URL}/it/shopping/item-{product_id}.aspx"
-            html = await self._fetch_page(shortcut_url, allow_404=True)
+            html = await self._fetch_page(shortcut_url)
             if html is not None:
                 return self._parse_html(html, product_id, shortcut_url)
 
-            # Shortcut falliito (404) → cerca l'URL reale tramite la ricerca interna
+            # Shortcut fallito (404) → cerca l'URL reale tramite la ricerca interna
             real_url = await self._resolve_url_via_search(product_id)
             if real_url:
                 html = await self._fetch_page(real_url)
@@ -129,35 +172,15 @@ class FarfetchClient:
         m = re.search(r"item-(\d+)\.aspx", text) or re.search(r"^(\d+)$", text)
         return m.group(1) if m else None
 
-    async def _fetch_page(self, url: str, allow_404: bool = False) -> Optional[str]:
-        headers = {"Referer": f"{self.BASE_URL}/it/"}
-        async with self.session.get(url, headers=headers) as resp:
-            if resp.status == 404:
-                if allow_404:
-                    return None
-                return None
-            if resp.status == 403:
-                raise ConnectionError(
-                    "Farfetch ha bloccato la richiesta (protezione anti-bot). "
-                    "Riprova tra qualche secondo."
-                )
-            if resp.status != 200:
-                raise ConnectionError(f"HTTP {resp.status} su {url}")
-            return await resp.text()
-
     async def _resolve_url_via_search(self, product_id: str) -> Optional[str]:
         """Usa la ricerca interna di Farfetch per trovare l'URL completo (con slug)
         a partire dal solo ID prodotto."""
         search_url = f"{self.BASE_URL}/it/shopping/items.aspx"
-        headers = {"Referer": f"{self.BASE_URL}/it/"}
         try:
-            async with self.session.get(
-                search_url, params={"q": product_id}, headers=headers
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text()
-        except Exception:
+            html = await self._fetch_page(search_url, params={"q": product_id})
+        except ConnectionError:
+            return None
+        if html is None:
             return None
 
         nd = self._next_data(html)
@@ -176,11 +199,11 @@ class FarfetchClient:
 
     def _deep_find_url_by_id(self, obj, pid: str, _depth: int = 0) -> Optional[str]:
         """Cerca ricorsivamente in una struttura JSON una stringa-URL che contenga
-        sia '.aspx' sia l'ID prodotto richiesto (es. '...-item-34618362.aspx')."""
+        sia '.aspx' sia l'ID prodotto richiesto."""
         if _depth > 12:
             return None
         if isinstance(obj, str):
-            if f"item-{pid}.aspx" in obj or f"item-{pid}" in obj and ".aspx" in obj:
+            if f"item-{pid}.aspx" in obj or (f"item-{pid}" in obj and ".aspx" in obj):
                 if obj.startswith("http"):
                     return obj.split("?")[0]
                 if obj.startswith("/"):
@@ -220,7 +243,6 @@ class FarfetchClient:
     def _parse_product_nd(self, data: Dict, pid: str) -> Optional[Dict]:
         try:
             pp = data["props"]["pageProps"]
-            # Farfetch può usare più chiavi diverse nel tempo
             p = (
                 pp.get("product") or
                 pp.get("productData") or
@@ -249,15 +271,12 @@ class FarfetchClient:
             return None
 
     def _build_product(self, p: Dict, pid: str) -> Dict:
-        # Brand
         brand_obj = p.get("brand") or {}
         brand = brand_obj.get("name") if isinstance(brand_obj, dict) else str(brand_obj)
 
-        # Prezzo
         price_obj = p.get("price") or p.get("priceInfo") or {}
         price = self._fmt_price(price_obj)
 
-        # Immagine
         imgs = p.get("images") or []
         image = None
         if imgs:
@@ -266,7 +285,6 @@ class FarfetchClient:
                 first.get("url") or first.get("src") or first.get("thumbnailUrl")
             )
 
-        # Taglie / stock
         sizes = self._extract_sizes(p)
 
         return {
@@ -304,11 +322,9 @@ class FarfetchClient:
             if not isinstance(v, dict):
                 continue
 
-            # Nome taglia
             size_val = v.get("size") or v.get("sizeName") or v.get("name") or {}
             size_name = size_val.get("name") if isinstance(size_val, dict) else str(size_val) if size_val else "N/A"
 
-            # Boutique disponibili
             boutiques = []
             merchants = v.get("merchants") or v.get("sellers") or v.get("partners") or []
             for m in merchants:
@@ -319,7 +335,6 @@ class FarfetchClient:
                         name = m.get("name") or m.get("merchantName") or "Boutique"
                         boutiques.append(name)
 
-            # Caso in cui lo stock è direttamente sulla variante
             if not boutiques:
                 qty = v.get("stock") or v.get("quantity") or 0
                 if qty > 0:
@@ -336,53 +351,44 @@ class FarfetchClient:
     # ─── 2. BOUTIQUE: tutti i prodotti ────────────────────────────────────────
 
     async def get_boutique_products(self, boutique_name: str) -> List[Dict]:
-        """
-        Cerca i prodotti di una boutique per nome.
-        Prima tenta la ricerca per sellers ID, poi via URL slug.
-        """
+        """Cerca i prodotti di una boutique per nome."""
         await self._warmup()
 
         slug = boutique_name.lower().strip().replace(" ", "-").replace("'", "")
         products = []
         seen_ids = set()
-        headers = {"Referer": f"{self.BASE_URL}/it/"}
 
         for gender in ("women", "men"):
             url = f"{self.BASE_URL}/it/shopping/{gender}/{slug}/items.aspx"
             try:
-                async with self.session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        html = await resp.text()
-                        items = self._parse_listing(html)
-                        for item in items:
-                            if item["id"] not in seen_ids:
-                                seen_ids.add(item["id"])
-                                products.append(item)
-            except Exception as e:
+                html = await self._fetch_page(url)
+                if html:
+                    items = self._parse_listing(html)
+                    for item in items:
+                        if item["id"] not in seen_ids:
+                            seen_ids.add(item["id"])
+                            products.append(item)
+            except ConnectionError as e:
                 print(f"[boutique/{gender}] {e}")
             await asyncio.sleep(0.5)
 
-        # Se non trovato con lo slug, prova la ricerca generica
         if not products:
             products = await self._search_boutique_fallback(boutique_name, seen_ids)
 
         return products
 
     async def _search_boutique_fallback(self, boutique_name: str, seen_ids: set) -> List[Dict]:
-        """Ricerca prodotti con il campo q= come fallback"""
         products = []
         url = f"{self.BASE_URL}/it/shopping/items.aspx"
-        params = {"q": boutique_name, "view": "list"}
         try:
-            async with self.session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    items = self._parse_listing(html)
-                    for item in items:
-                        if item["id"] not in seen_ids:
-                            seen_ids.add(item["id"])
-                            products.append(item)
-        except Exception as e:
+            html = await self._fetch_page(url, params={"q": boutique_name, "view": "list"})
+            if html:
+                items = self._parse_listing(html)
+                for item in items:
+                    if item["id"] not in seen_ids:
+                        seen_ids.add(item["id"])
+                        products.append(item)
+        except ConnectionError as e:
             print(f"[boutique_fallback] {e}")
         return products
 
@@ -450,12 +456,15 @@ class FarfetchClient:
                 image = first if isinstance(first, str) else (
                     first.get("url") or first.get("src") or first.get("thumbnailUrl")
                 )
+
+            url = self._deep_find_url_by_id(item, pid) or f"{self.BASE_URL}/it/shopping/item-{pid}.aspx"
+
             return {
                 "id": pid,
                 "name": item.get("name") or item.get("shortDescription") or "N/A",
                 "brand": brand or "N/A",
                 "price": price,
-                "url": f"https://www.farfetch.com/it/shopping/item-{pid}.aspx",
+                "url": url,
                 "image": image,
             }
         except Exception:

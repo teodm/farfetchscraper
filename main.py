@@ -3,8 +3,11 @@ Bot Discord per Farfetch
 Comandi:
   /prodotto <id>       → disponibilità per taglia/boutique
   /boutique  <nome>    → tutti i prodotti di una boutique
+  /debug                → scarica un report completo dell'ultima richiesta HTTP
+                          (utile per diagnosticare blocchi anti-bot)
 """
 import asyncio
+import io
 import os
 import textwrap
 
@@ -84,8 +87,20 @@ async def cmd_prodotto(interaction: discord.Interaction, product_id: str):
         return
 
     if not data:
+        debug = farfetch.last_debug or {}
+        debug_str = ""
+        if debug:
+            debug_str = (
+                f"\n\n🔧 *Debug:* status `{debug.get('status', '?')}` "
+                f"su `{debug.get('url', '?')}`"
+            )
+            if debug.get("snippet"):
+                debug_str += f"\n```{debug['snippet'][:150]}```"
         await interaction.followup.send(
-            embed=_err_embed("Prodotto non trovato", f"Nessun risultato per **{identifier}**.")
+            embed=_err_embed(
+                "Prodotto non trovato",
+                f"Nessun risultato per **{identifier}**.{debug_str}"
+            )
         )
         return
 
@@ -189,6 +204,37 @@ async def cmd_boutique(interaction: discord.Interaction, nome: str):
         else:
             await interaction.channel.send(embed=embed)   # type: ignore
             await asyncio.sleep(0.3)
+
+# ─── /debug ───────────────────────────────────────────────────────────────────
+
+@bot.tree.command(
+    name="debug",
+    description="Scarica un report completo dell'ultima richiesta fatta a Farfetch (per diagnosticare errori)"
+)
+async def cmd_debug(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    report = farfetch.debug_report()
+    if not report:
+        await interaction.followup.send(
+            embed=_err_embed(
+                "Nessun dato disponibile",
+                "Non è stata ancora fatta nessuna richiesta a Farfetch in questa sessione. "
+                "Usa prima `/prodotto` o `/boutique`, poi richiama `/debug`."
+            )
+        )
+        return
+
+    file_bytes = io.BytesIO(report.encode("utf-8"))
+    file = discord.File(file_bytes, filename="farfetch_debug.txt")
+
+    await interaction.followup.send(
+        content=(
+            "📄 Ecco il report completo dell'ultima richiesta fatta a Farfetch.\n"
+            "Scarica il file e caricalo in chat per la diagnosi."
+        ),
+        file=file,
+    )
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
