@@ -56,28 +56,36 @@ async def on_close():
 
 @bot.tree.command(
     name="prodotto",
-    description="Mostra disponibilità per taglia dato un ID prodotto Farfetch"
+    description="Mostra disponibilità per taglia dato un ID o un link Farfetch"
 )
-@app_commands.describe(product_id="ID del prodotto su Farfetch (es. 21894573)")
+@app_commands.describe(
+    product_id="ID numerico (es. 34618362) oppure link completo del prodotto Farfetch"
+)
 async def cmd_prodotto(interaction: discord.Interaction, product_id: str):
     await interaction.response.defer(thinking=True)
 
-    product_id = product_id.strip()
-    if not product_id.isdigit():
+    identifier = product_id.strip()
+    is_url = "farfetch.com" in identifier
+    is_digits = identifier.isdigit()
+
+    if not is_url and not is_digits:
         await interaction.followup.send(
-            embed=_err_embed("ID non valido", "L'ID deve essere numerico (es. `21894573`).")
+            embed=_err_embed(
+                "Input non valido",
+                "Inserisci un ID numerico (es. `34618362`) oppure incolla il link completo del prodotto Farfetch."
+            )
         )
         return
 
     try:
-        data = await farfetch.get_product(product_id)
+        data = await farfetch.get_product(identifier)
     except Exception as e:
         await interaction.followup.send(embed=_err_embed("Errore di rete", str(e)))
         return
 
     if not data:
         await interaction.followup.send(
-            embed=_err_embed("Prodotto non trovato", f"Nessun risultato per ID **{product_id}**.")
+            embed=_err_embed("Prodotto non trovato", f"Nessun risultato per **{identifier}**.")
         )
         return
 
@@ -87,7 +95,7 @@ async def cmd_prodotto(interaction: discord.Interaction, product_id: str):
         color=COLOR_OK,
     )
     embed.add_field(name="💰 Prezzo", value=data["price"], inline=True)
-    embed.add_field(name="🆔 ID", value=f"`{product_id}`", inline=True)
+    embed.add_field(name="🆔 ID", value=f"`{data['id']}`", inline=True)
     embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     sizes = data.get("sizes") or []

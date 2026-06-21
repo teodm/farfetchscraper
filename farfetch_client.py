@@ -89,18 +89,52 @@ class FarfetchClient:
 
     # ─── 1. PRODOTTO: stock per taglia/boutique ────────────────────────────────
 
-    async def get_product(self, product_id: str) -> Optional[Dict]:
+    async def get_product(self, identifier: str) -> Optional[Dict]:
         """
+        Accetta sia un ID numerico (es. "34618362") sia un link Farfetch completo.
         Restituisce un dict con:
           name, brand, price, image, url, sizes
           sizes = [{"size": "M", "boutiques": ["Boutique A", "Boutique B"], "available": True}, ...]
         """
         await self._warmup()
 
-        url = f"{self.BASE_URL}/it/shopping/item-{product_id}.aspx"
+        identifier = identifier.strip()
+        product_id = self._extract_id(identifier)
+
+        # Caso 1: l'utente ha incollato un link Farfetch completo → usalo direttamente
+        if "farfetch.com" in identifier:
+            page_url = identifier.split("?")[0]  # rimuove parametri di tracking
+            html = await self._fetch_page(page_url)
+            if html is None:
+                return None
+            return self._parse_html(html, product_id or "N/A", page_url)
+
+        # Caso 2: solo l'ID → prova lo shortcut diretto
+        if product_id:
+            shortcut_url = f"{self.BASE_URL}/it/shopping/item-{product_id}.aspx"
+            html = await self._fetch_page(shortcut_url, allow_404=True)
+            if html is not None:
+                return self._parse_html(html, product_id, shortcut_url)
+
+            # Shortcut falliito (404) → cerca l'URL reale tramite la ricerca interna
+            real_url = await self._resolve_url_via_search(product_id)
+            if real_url:
+                html = await self._fetch_page(real_url)
+                if html is not None:
+                    return self._parse_html(html, product_id, real_url)
+
+        return None
+
+    def _extract_id(self, text: str) -> Optional[str]:
+        m = re.search(r"item-(\d+)\.aspx", text) or re.search(r"^(\d+)$", text)
+        return m.group(1) if m else None
+
+    async def _fetch_page(self, url: str, allow_404: bool = False) -> Optional[str]:
         headers = {"Referer": f"{self.BASE_URL}/it/"}
         async with self.session.get(url, headers=headers) as resp:
             if resp.status == 404:
+                if allow_404:
+                    return None
                 return None
             if resp.status == 403:
                 raise ConnectionError(
@@ -108,20 +142,78 @@ class FarfetchClient:
                     "Riprova tra qualche secondo."
                 )
             if resp.status != 200:
-                raise ConnectionError(f"HTTP {resp.status} per ID {product_id}")
-            html = await resp.text()
+                raise ConnectionError(f"HTTP {resp.status} su {url}")
+            return await resp.text()
 
-        # Prova prima __NEXT_DATA__
+    async def _resolve_url_via_search(self, product_id: str) -> Optional[str]:
+        """Usa la ricerca interna di Farfetch per trovare l'URL completo (con slug)
+        a partire dal solo ID prodotto."""
+        search_url = f"{self.BASE_URL}/it/shopping/items.aspx"
+        headers = {"Referer": f"{self.BASE_URL}/it/"}
+        try:
+            async with self.session.get(
+                search_url, params={"q": product_id}, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+        except Exception:
+            return None
+
         nd = self._next_data(html)
         if nd:
-            result = self._parse_product_nd(nd, product_id)
-            if result:
-                return result
+            found = self._deep_find_url_by_id(nd, product_id)
+            if found:
+                return found
 
-        # Fallback __INITIAL_STATE__
         ist = self._initial_state(html)
         if ist:
-            return self._parse_product_is(ist, product_id)
+            found = self._deep_find_url_by_id(ist, product_id)
+            if found:
+                return found
+
+        return None
+
+    def _deep_find_url_by_id(self, obj, pid: str, _depth: int = 0) -> Optional[str]:
+        """Cerca ricorsivamente in una struttura JSON una stringa-URL che contenga
+        sia '.aspx' sia l'ID prodotto richiesto (es. '...-item-34618362.aspx')."""
+        if _depth > 12:
+            return None
+        if isinstance(obj, str):
+            if f"item-{pid}.aspx" in obj or f"item-{pid}" in obj and ".aspx" in obj:
+                if obj.startswith("http"):
+                    return obj.split("?")[0]
+                if obj.startswith("/"):
+                    return (self.BASE_URL + obj).split("?")[0]
+            return None
+        if isinstance(obj, dict):
+            for v in obj.values():
+                res = self._deep_find_url_by_id(v, pid, _depth + 1)
+                if res:
+                    return res
+            return None
+        if isinstance(obj, list):
+            for v in obj:
+                res = self._deep_find_url_by_id(v, pid, _depth + 1)
+                if res:
+                    return res
+            return None
+        return None
+
+    def _parse_html(self, html: str, pid: str, page_url: str) -> Optional[Dict]:
+        nd = self._next_data(html)
+        if nd:
+            result = self._parse_product_nd(nd, pid)
+            if result:
+                result["url"] = page_url
+                return result
+
+        ist = self._initial_state(html)
+        if ist:
+            result = self._parse_product_is(ist, pid)
+            if result:
+                result["url"] = page_url
+                return result
 
         return None
 
